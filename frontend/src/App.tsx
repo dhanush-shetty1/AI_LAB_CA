@@ -30,6 +30,7 @@ type Subject = {
 }
 
 type PlanResponse = {
+  generated_at?: string
   study_plan: Array<{ subject: string; daily_goal: string; focus_topics: string[] }>
   priority_list: string[]
   time_allocation: {
@@ -37,6 +38,323 @@ type PlanResponse = {
     allocations: Array<{ subject: string; hours_per_day: number }>
   }
   adjustment_notes?: string
+}
+
+const escapeCsvValue = (value: string | number | null | undefined) => {
+  const normalizedValue = value == null ? '' : String(value)
+  return /[",\n]/.test(normalizedValue) ? `"${normalizedValue.replace(/"/g, '""')}"` : normalizedValue
+}
+
+const formatHoursAndMinutes = (hours: number) => {
+  const totalMinutes = Math.max(0, Math.round(hours * 60))
+  const wholeHours = Math.floor(totalMinutes / 60)
+  const minutes = totalMinutes % 60
+
+  if (wholeHours > 0 && minutes > 0) {
+    return `${wholeHours} hr${wholeHours === 1 ? '' : 's'} ${minutes} min`
+  }
+  if (wholeHours > 0) {
+    return `${wholeHours} hr${wholeHours === 1 ? '' : 's'}`
+  }
+  return `${minutes} min`
+}
+
+const normalizeSubjectKey = (value: string) => value.trim().toLowerCase().replace(/\s+/g, ' ')
+const normalizeLooseSubjectKey = (value: string) =>
+  normalizeSubjectKey(value)
+    .replace(/[^a-z0-9 ]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+const scoreSubjectSimilarity = (left: string, right: string) => {
+  const normalizedLeft = normalizeLooseSubjectKey(left)
+  const normalizedRight = normalizeLooseSubjectKey(right)
+
+  if (!normalizedLeft || !normalizedRight) return 0
+  if (normalizedLeft === normalizedRight) return 1
+  if (normalizedLeft.includes(normalizedRight) || normalizedRight.includes(normalizedLeft)) return 0.9
+
+  const leftTokens = new Set(normalizedLeft.split(' ').filter(Boolean))
+  const rightTokens = new Set(normalizedRight.split(' ').filter(Boolean))
+  let overlapCount = 0
+
+  leftTokens.forEach((token) => {
+    if (rightTokens.has(token)) overlapCount += 1
+  })
+
+  if (overlapCount === 0) return 0
+  return overlapCount / Math.max(leftTokens.size, rightTokens.size)
+}
+
+const findBestSubjectMatch = <T,>(subjectName: string, candidates: T[], getLabel: (candidate: T) => string) => {
+  let bestMatch: T | null = null
+  let bestScore = 0
+
+  candidates.forEach((candidate) => {
+    const score = scoreSubjectSimilarity(subjectName, getLabel(candidate))
+    if (score > bestScore) {
+      bestScore = score
+      bestMatch = candidate
+    }
+  })
+
+  return bestScore >= 0.5 ? bestMatch : null
+}
+
+const parseIsoDate = (value: string) => {
+  const [year, month, day] = value.split('-').map(Number)
+  if (!year || !month || !day) return null
+
+  const parsedDate = new Date(year, month - 1, day)
+  return Number.isNaN(parsedDate.getTime()) ? null : parsedDate
+}
+
+const formatExamDate = (value: string) => {
+  const parsedDate = parseIsoDate(value)
+  if (!parsedDate) return value
+
+  return new Intl.DateTimeFormat('en-GB', {
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+  }).format(parsedDate)
+}
+
+const getDaysLeftUntilExam = (value: string) => {
+  const parsedDate = parseIsoDate(value)
+  if (!parsedDate) return null
+
+  const today = new Date()
+  today.setHours(0, 0, 0, 0)
+  return Math.round((parsedDate.getTime() - today.getTime()) / 86_400_000)
+}
+
+const getUrgencyLabel = (daysLeft: number | null) => {
+  if (daysLeft == null) return 'unknown'
+  if (daysLeft <= 7) return 'high'
+  if (daysLeft <= 21) return 'medium'
+  return 'low'
+}
+
+const formatGeneratedAt = (value?: string) => {
+  if (!value) return ''
+
+  const parsedDate = new Date(value)
+  if (Number.isNaN(parsedDate.getTime())) return value
+
+  return new Intl.DateTimeFormat('en-GB', {
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(parsedDate)
+}
+
+const buildSubjectReasoning = ({
+  subjectName,
+  examDate,
+  priorityRank,
+  hoursPerDay,
+  isWeakSubject,
+  focusTopics,
+  dailyGoal,
+}: {
+  subjectName: string
+  examDate: string
+  priorityRank: number | null
+  hoursPerDay: number | null
+  isWeakSubject: boolean
+  focusTopics: string[]
+  dailyGoal?: string
+}) => {
+  const reasoningParts: string[] = []
+  const daysLeft = getDaysLeftUntilExam(examDate)
+  const urgency = getUrgencyLabel(daysLeft)
+
+  if (examDate) {
+    const formattedExamDate = formatExamDate(examDate)
+
+    if (daysLeft == null) {
+      reasoningParts.push(`Exam is scheduled for ${formattedExamDate}.`)
+    } else if (daysLeft < 0) {
+      reasoningParts.push(
+        `${subjectName} had an exam on ${formattedExamDate}, which is ${Math.abs(daysLeft)} day${
+          Math.abs(daysLeft) === 1 ? '' : 's'
+        } ago.`,
+      )
+    } else if (daysLeft === 0) {
+      reasoningParts.push(`${subjectName} has its exam today (${formattedExamDate}), so it needs immediate revision.`)
+    } else {
+      reasoningParts.push(
+        `${subjectName} has its exam on ${formattedExamDate} with ${daysLeft} day${
+          daysLeft === 1 ? '' : 's'
+        } left, so its urgency is ${urgency}.`,
+      )
+    }
+  } else {
+    reasoningParts.push(`${subjectName} does not have a matched exam date in the exported plan, so ranking is based on the planner output.`)
+  }
+
+  if (priorityRank != null) {
+    reasoningParts.push(`It is ranked #${priorityRank + 1} in the priority order.`)
+  }
+
+  if (hoursPerDay != null) {
+    reasoningParts.push(`The planner allocates ${formatHoursAndMinutes(hoursPerDay)} per day.`)
+  }
+
+  if (isWeakSubject) {
+    reasoningParts.push('It gets extra attention because you marked it as a weak subject.')
+  }
+
+  if (focusTopics.length > 0) {
+    reasoningParts.push(`Key focus topics: ${focusTopics.join(', ')}.`)
+  }
+
+  if (dailyGoal?.trim()) {
+    reasoningParts.push(`Daily goal: ${dailyGoal.trim()}.`)
+  }
+
+  return reasoningParts.join(' ')
+}
+
+const buildPlanCsv = (plan: PlanResponse, subjects: Subject[], weakSubjectsText: string) => {
+  const hoursBySubject = new Map(
+    plan.time_allocation.allocations.map((allocation) => [normalizeSubjectKey(allocation.subject), allocation.hours_per_day]),
+  )
+  const studyPlanBySubject = new Map(plan.study_plan.map((entry) => [normalizeSubjectKey(entry.subject), entry]))
+  const priorityRankBySubject = new Map(plan.priority_list.map((subject, index) => [normalizeSubjectKey(subject), index]))
+  const weakSubjectSet = new Set(
+    weakSubjectsText
+      .split(',')
+      .map((subject) => normalizeSubjectKey(subject))
+      .filter(Boolean),
+  )
+
+  const headers = [
+    'subject',
+    'exam_date',
+    'days_left',
+    'urgency',
+    'priority_rank',
+    'study_time_per_day',
+    'weak_subject',
+    'daily_goal',
+    'focus_topics',
+    'subject_reasoning',
+    'plan_generated_at',
+  ]
+
+  const rows = subjects.map((subject) => {
+    const subjectKey = normalizeSubjectKey(subject.name)
+    const matchedStudyPlanEntry =
+      studyPlanBySubject.get(subjectKey) ?? findBestSubjectMatch(subject.name, plan.study_plan, (entry) => entry.subject)
+    const matchedAllocation =
+      hoursBySubject.get(subjectKey) != null
+        ? { subject: subject.name, hours_per_day: hoursBySubject.get(subjectKey) as number }
+        : findBestSubjectMatch(subject.name, plan.time_allocation.allocations, (allocation) => allocation.subject)
+    const matchedPrioritySubject =
+      priorityRankBySubject.get(subjectKey) != null
+        ? subject.name
+        : findBestSubjectMatch(subject.name, plan.priority_list, (prioritySubject) => prioritySubject)
+    const priorityRank =
+      priorityRankBySubject.get(subjectKey) ??
+      (matchedPrioritySubject ? plan.priority_list.findIndex((prioritySubject) => prioritySubject === matchedPrioritySubject) : -1)
+    const hoursPerDay = matchedAllocation?.hours_per_day ?? null
+    const examDate = subject.exam_date
+    const subjectName = subject.name.trim()
+    const studyPlanEntry = matchedStudyPlanEntry
+    const focusTopics = studyPlanEntry?.focus_topics ?? []
+    const daysLeft = getDaysLeftUntilExam(examDate)
+    const isWeakSubject = weakSubjectSet.has(subjectKey)
+
+    return [
+      subjectName,
+      examDate ? formatExamDate(examDate) : '',
+      daysLeft ?? '',
+      getUrgencyLabel(daysLeft),
+      priorityRank >= 0 ? priorityRank + 1 : '',
+      hoursPerDay == null ? '' : formatHoursAndMinutes(hoursPerDay),
+      isWeakSubject ? 'yes' : 'no',
+      studyPlanEntry?.daily_goal ?? '',
+      focusTopics.join('; '),
+      buildSubjectReasoning({
+        subjectName,
+        examDate,
+        priorityRank,
+        hoursPerDay,
+        isWeakSubject,
+        focusTopics,
+        dailyGoal: studyPlanEntry?.daily_goal,
+      }),
+      formatGeneratedAt(plan.generated_at),
+    ]
+      .map(escapeCsvValue)
+      .join(',')
+  })
+
+  return [headers.join(','), ...rows].join('\n')
+}
+
+const buildSampleCsv = () =>
+  [
+    [
+      'subject',
+      'exam_date',
+      'days_left',
+      'urgency',
+      'priority_rank',
+      'study_time_per_day',
+      'weak_subject',
+      'daily_goal',
+      'focus_topics',
+      'subject_reasoning',
+      'plan_generated_at',
+    ].join(','),
+    [
+      'Applied Mathematics',
+      '15 Apr 2026',
+      16,
+      'medium',
+      1,
+      '2 hrs 30 min',
+      'yes',
+      'Finish problem-solving practice for calculus and matrices.',
+      'Integration; Matrices; Differential Equations',
+      'Applied Mathematics is prioritized because its exam is closer, you marked it as weak, and the planner assigns extra daily study time for revision-heavy topics.',
+      '30 Mar 2026, 10:30',
+    ]
+      .map(escapeCsvValue)
+      .join(','),
+    [
+      'Physics',
+      '22 Apr 2026',
+      23,
+      'low',
+      2,
+      '1 hr 30 min',
+      'no',
+      'Revise derivations and complete one timed chapter test.',
+      'Modern Physics; Optics; Semiconductor Devices',
+      'Physics is scheduled after Mathematics because the exam is later, but it still keeps steady daily revision to avoid last-minute cramming.',
+      '30 Mar 2026, 10:30',
+    ]
+      .map(escapeCsvValue)
+      .join(','),
+  ].join('\n')
+
+const downloadCsvFile = (filename: string, content: string) => {
+  const csvBlob = new Blob([content], { type: 'text/csv;charset=utf-8;' })
+  const downloadUrl = URL.createObjectURL(csvBlob)
+  const link = document.createElement('a')
+
+  link.href = downloadUrl
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  URL.revokeObjectURL(downloadUrl)
 }
 
 function App() {
@@ -57,7 +375,23 @@ function App() {
 
   const handleAddSubject = () => {
     if (!subjectName.trim() || !examDate) return
-    setSubjects((prev) => [...prev, { name: subjectName.trim(), exam_date: examDate }])
+    const normalizedSubjectName = normalizeSubjectKey(subjectName)
+
+    setSubjects((prev) => {
+      const existingIndex = prev.findIndex((subject) => normalizeSubjectKey(subject.name) === normalizedSubjectName)
+      if (existingIndex === -1) {
+        return [...prev, { name: subjectName.trim(), exam_date: examDate }]
+      }
+
+      const nextSubjects = [...prev]
+      nextSubjects[existingIndex] = {
+        ...nextSubjects[existingIndex],
+        exam_date: examDate,
+      }
+      return nextSubjects
+    })
+
+    setError('')
     setSubjectName('')
     setExamDate('')
   }
@@ -137,6 +471,26 @@ function App() {
     }
   }
 
+  const handleExportCsv = () => {
+    if (!plan) {
+      setError('Generate a study plan before exporting CSV.')
+      return
+    }
+
+    setError('')
+    const csvContent = buildPlanCsv(plan, subjects, weakSubjectsText)
+    const safeTimestamp = (plan.generated_at ?? new Date().toISOString()).replace(/[:.]/g, '-')
+    downloadCsvFile(`study-plan-${safeTimestamp}.csv`, csvContent)
+  }
+
+  const handleLaunchPlannerConsole = () => {
+    document.getElementById('planner-console')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
+
+  const handleDownloadSampleCsv = () => {
+    downloadCsvFile('study-plan-sample.csv', buildSampleCsv())
+  }
+
   return (
     <div className="app-shell">
       <div className="aurora aurora-one" aria-hidden="true" />
@@ -154,8 +508,12 @@ function App() {
         </p>
 
         <div className="hero-actions">
-          <button className="btn btn-primary">Launch Planner Console</button>
-          <button className="btn btn-secondary">View Sample CSV</button>
+          <button className="btn btn-primary" onClick={handleLaunchPlannerConsole}>
+            Launch Planner Console
+          </button>
+          <button className="btn btn-secondary" onClick={handleDownloadSampleCsv}>
+            View Sample CSV
+          </button>
         </div>
 
         <section className="stats-grid" aria-label="Planner stats">
@@ -285,7 +643,7 @@ function App() {
           </div>
         </section>
 
-        <section className="panel export-panel">
+        <section className="panel export-panel" id="planner-console">
           <div className="panel-head">
             <h2>CSV Export Dock</h2>
             <span className="badge">OUTPUT</span>
@@ -294,16 +652,49 @@ function App() {
           <button className="btn btn-primary full-width" onClick={handleGeneratePlan} disabled={loading}>
             {loading ? 'Generating Plan...' : 'Generate Study Plan'}
           </button>
+          <button
+            className="btn btn-secondary full-width"
+            onClick={handleExportCsv}
+            disabled={!plan || loading}
+            style={{ marginTop: '0.75rem' }}
+          >
+            Download Study Plan CSV
+          </button>
           {error && (
             <p style={{ color: '#ff6b6b', marginTop: '0.5rem' }}>
               Error: {error}
             </p>
           )}
-          <div className="terminal-preview" aria-hidden="true">
-            <p>&gt; parsing syllabus.pdf</p>
-            <p>&gt; syncing exam timetable...</p>
-            <p>&gt; building study-plan.csv</p>
-            <p className="ok">status: success</p>
+          <div className="terminal-preview" aria-live="polite">
+            {loading ? (
+              <>
+                <p>&gt; parsing syllabus.pdf</p>
+                <p>&gt; syncing exam timetable...</p>
+                <p>&gt; generating study plan...</p>
+                <p className="ok">status: running</p>
+              </>
+            ) : error ? (
+              <>
+                <p>&gt; planner request failed</p>
+                <p>&gt; check backend connection or input data</p>
+                <p>&gt; csv export unavailable</p>
+                <p style={{ color: '#ff6b6b' }}>status: error</p>
+              </>
+            ) : plan ? (
+              <>
+                <p>&gt; planner response received</p>
+                <p>&gt; matched {subjects.length} subject(s)</p>
+                <p>&gt; study-plan.csv ready for download</p>
+                <p className="ok">status: success</p>
+              </>
+            ) : (
+              <>
+                <p>&gt; waiting for syllabus and exam inputs</p>
+                <p>&gt; planner engine idle</p>
+                <p>&gt; csv export dock standing by</p>
+                <p>status: idle</p>
+              </>
+            )}
           </div>
           {plan && (
             <div style={{ marginTop: '1rem' }}>
@@ -312,9 +703,15 @@ function App() {
               <h3>Time Allocation</h3>
               {plan.time_allocation.allocations.map((a) => (
                 <p key={a.subject}>
-                  {a.subject}: {a.hours_per_day} hrs/day
+                  {a.subject}: {formatHoursAndMinutes(a.hours_per_day)}/day
                 </p>
               ))}
+              {plan.adjustment_notes && (
+                <>
+                  <h3>Adjustment Notes</h3>
+                  <p>{plan.adjustment_notes}</p>
+                </>
+              )}
             </div>
           )}
         </section>

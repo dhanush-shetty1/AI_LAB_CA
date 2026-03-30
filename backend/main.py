@@ -1,7 +1,8 @@
 import io
 import json
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+from difflib import get_close_matches
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -139,6 +140,92 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     return "\n".join(text_chunks).strip()
 
 
+def normalize_subject_name(value: str) -> str:
+    return " ".join(value.strip().lower().split())
+
+
+def canonicalize_subject_name(value: str, allowed_subjects: List[str]) -> str:
+    normalized_allowed = {normalize_subject_name(subject): subject for subject in allowed_subjects}
+    normalized_value = normalize_subject_name(value)
+
+    if normalized_value in normalized_allowed:
+        return normalized_allowed[normalized_value]
+
+    close_match = get_close_matches(normalized_value, list(normalized_allowed.keys()), n=1, cutoff=0.6)
+    if close_match:
+        return normalized_allowed[close_match[0]]
+
+    return value.strip()
+
+
+def canonicalize_final_plan(
+    final_plan: Dict[str, Any],
+    allowed_subjects: List[str],
+    fallback_allocation: Dict[str, Any],
+) -> Dict[str, Any]:
+    canonical_study_plan: List[Dict[str, Any]] = []
+    seen_study_subjects = set()
+    for item in final_plan.get("study_plan", []):
+        if not isinstance(item, dict):
+            continue
+        subject_name = canonicalize_subject_name(str(item.get("subject", "")), allowed_subjects)
+        if not subject_name or subject_name in seen_study_subjects:
+            continue
+        seen_study_subjects.add(subject_name)
+        canonical_study_plan.append(
+            {
+                "subject": subject_name,
+                "focus_topics": item.get("focus_topics", []),
+                "daily_goal": item.get("daily_goal", ""),
+            }
+        )
+
+    canonical_priority_list: List[str] = []
+    seen_priority_subjects = set()
+    for subject_name in final_plan.get("priority_list", []):
+        canonical_name = canonicalize_subject_name(str(subject_name), allowed_subjects)
+        if not canonical_name or canonical_name in seen_priority_subjects:
+            continue
+        seen_priority_subjects.add(canonical_name)
+        canonical_priority_list.append(canonical_name)
+
+    if not canonical_priority_list:
+        canonical_priority_list = [item["subject"] for item in fallback_allocation.get("allocations", [])]
+
+    raw_time_allocation = final_plan.get("time_allocation", fallback_allocation)
+    allocations_source = raw_time_allocation.get("allocations", fallback_allocation.get("allocations", []))
+    canonical_allocations: List[Dict[str, Any]] = []
+    seen_allocation_subjects = set()
+    for item in allocations_source:
+        if not isinstance(item, dict):
+            continue
+        canonical_name = canonicalize_subject_name(str(item.get("subject", "")), allowed_subjects)
+        if not canonical_name or canonical_name in seen_allocation_subjects:
+            continue
+        seen_allocation_subjects.add(canonical_name)
+        canonical_allocations.append(
+            {
+                "subject": canonical_name,
+                "hours_per_day": item.get("hours_per_day", 0),
+            }
+        )
+
+    canonical_time_allocation = {
+        "total_hours_per_day": raw_time_allocation.get(
+            "total_hours_per_day",
+            fallback_allocation.get("total_hours_per_day", 0),
+        ),
+        "allocations": canonical_allocations or fallback_allocation.get("allocations", []),
+    }
+
+    return {
+        **final_plan,
+        "study_plan": canonical_study_plan,
+        "priority_list": canonical_priority_list,
+        "time_allocation": canonical_time_allocation,
+    }
+
+
 # -----------------------------
 # LLM utility
 # -----------------------------
@@ -186,6 +273,7 @@ Rules:
 3) Keep plan realistic for a student.
 4) Ensure priority_list matches urgency.
 5) Output JSON only; no markdown.
+6) Use subject names exactly as provided in the input. Do not rename, abbreviate, merge, or paraphrase them.
 """
     # Prefer stronger free models first, then fallback for compatibility.
     candidate_models = [MODEL_NAME, "gemini-2.0-flash", "gemini-1.5-flash"]
@@ -274,10 +362,11 @@ def run_react_agent(request: PlanRequest) -> Dict[str, Any]:
 
     # Step 6: Final answer via LLM
     final_plan = call_gemini_for_plan(request, deadline_data, allocation, prior)
+    final_plan = canonicalize_final_plan(final_plan, [subject.name for subject in request.subjects], allocation)
     logs.append({"step": "Final Answer", "content": "Generated structured plan using Gemini."})
 
     result = {
-        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "study_plan": final_plan.get("study_plan", []),
         "priority_list": final_plan.get("priority_list", []),
         "time_allocation": final_plan.get("time_allocation", allocation),
