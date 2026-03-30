@@ -337,53 +337,9 @@ Solution: Ensure the backend server is running on port 8000.
 
 ---
 
-## 📄 License
 
-Licensed under the MIT License. See the LICENSE file for details.
 
----
 
-## 🤝 Contributing
 
-We welcome contributions! To contribute:
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
 
----
-
-## 📞 Support & Contact
-
-For issues, questions, or suggestions:
-
-- **GitHub Issues**: [Report an issue](https://github.com/dhanush-shetty1/AI_LAB_CA/issues)
-- **Email**: Contact the development team
-- **Documentation**: Check the API docs at `/docs` endpoint
-
----
-
-## 🙏 Acknowledgments
-
-- Google Gemini API for AI-powered plan generation
-- FastAPI for the robust backend framework
-- React and Vite for the modern frontend experience
-- PyPDF for PDF processing capabilities
-
----
-
-## 📈 Roadmap
-
-- [ ] Multi-language support
-- [ ] Mobile app (iOS/Android)
-- [ ] Advanced analytics and study progress tracking
-- [ ] Integration with popular calendar applications
-- [ ] Collaborative study planning
-- [ ] Video tutorial integration
-- [ ] Real-time progress monitoring
-
----
-
-**Made with ❤️ for students everywhere**
