@@ -1,0 +1,92 @@
+# 🚀 QUICK START - 2 MINUTES
+
+## ONE COMMAND TO RUN EVERYTHING:
+```
+Double-click: START_APP.bat
+```
+
+---
+
+## OR MANUAL START:
+
+### Terminal 1 (Backend):
+```bash
+cd AI_LAB_CA\backend
+start-backend.bat
+# Wait for: "Uvicorn running on http://127.0.0.1:8000"
+```
+
+### Terminal 2 (Frontend):
+```bash
+cd AI_LAB_CA\frontend
+start-frontend.bat
+# Wait for: "Local: http://localhost:5173"
+```
+
+### Then:
+1. Open browser: `http://localhost:5173`
+2. Fill in the form:
+   - Hours/Day: `5` (or your available hours)
+   - Weak Subjects: `Math, Physics` (comma-separated)
+3. Add subjects OR upload PDFs
+4. Click "Generate Study Plan"
+5. Download CSV
+
+---
+
+## WHAT YOU NEED:
+- Windows Command Prompt (or Terminal)
+- Browser (Chrome, Firefox, Edge, Safari)
+- That's it! Python & Node.js already available in your system
+
+---
+
+## IF SOMETHING FAILS:
+
+### ❌ "Cannot connect to backend"
+→ Click "Check Backend Status" button in the app
+
+### ❌ "Backend not running"
+→ Terminal 1 - Check if it shows "Uvicorn running on http://127.0.0.1:8000"
+
+### ❌ "Frontend not loading"
+→ Terminal 2 - Check if it shows "Local: http://localhost:5173"
+
+### ❌ "API key error"
+→ Check `backend/.env` has `GEMINI_API_KEY=...`
+
+---
+
+## KEYBOARD SHORTCUTS:
+
+- **F12** - Open browser dev console (for error messages)
+- **Ctrl+C** - Stop either service (in terminal)
+
+---
+
+## FILES YOU CREATED:
+
+✅ `backend/requirements.txt` - Dependencies
+✅ `backend/start-backend.bat` - Backend launcher
+✅ `frontend/.env` - API configuration
+✅ `frontend/start-frontend.bat` - Frontend launcher
+✅ `START_APP.bat` - Master launcher (RECOMMENDED)
+✅ `STARTUP_GUIDE.md` - Detailed guide
+✅ `SYSTEM_CHECK.md` - Full system info
+
+---
+
+## WHAT'S WORKING:
+
+✅ PDF syllabus upload
+✅ PDF timetable upload
+✅ Manual subject entry
+✅ Study plan generation
+✅ CSV export
+✅ Backend health check
+✅ Error messages
+✅ Auto-save to memory
+
+---
+
+**NEXT STEP:** Run `START_APP.bat` now! 🚀

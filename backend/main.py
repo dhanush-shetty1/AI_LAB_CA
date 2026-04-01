@@ -10,6 +10,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from pypdf import PdfReader
+import pdfplumber
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -49,10 +50,11 @@ class SubjectInput(BaseModel):
 
 
 class PlanRequest(BaseModel):
-    subjects: List[SubjectInput]
-    hours_per_day: float = Field(..., gt=0, le=24)
-    weak_subjects: List[str] = Field(default_factory=list)
+    subjects: Optional[List[SubjectInput]] = None
+    hours_per_day: Optional[float] = Field(5, gt=0, le=24)
+    weak_subjects: Optional[List[str]] = None
     syllabus_text: Optional[str] = None
+    timetable_text: Optional[str] = None
     use_memory: bool = True
 
 
@@ -133,11 +135,60 @@ def study_time_allocator_tool(
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     if not pdf_bytes:
         return ""
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    text_chunks: List[str] = []
-    for page in reader.pages:
-        text_chunks.append(page.extract_text() or "")
-    return "\n".join(text_chunks).strip()
+    
+    # Try pypdf first
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        if len(reader.pages) == 0:
+            raise Exception("PDF has no pages")
+        
+        text_chunks: List[str] = []
+        for page_num, page in enumerate(reader.pages):
+            try:
+                text = page.extract_text() or ""
+                if text.strip():
+                    text_chunks.append(text)
+                else:
+                    # Try alternative extraction method if standard fails
+                    try:
+                        text = page.extract_text(extraction_mode="layout")
+                        if text.strip():
+                            text_chunks.append(text)
+                    except Exception:
+                        pass
+            except Exception as exc:
+                # Log but continue with next page
+                print(f"Warning: Failed to extract text from page {page_num} with pypdf: {exc}")
+                continue
+        
+        result = "\n".join(text_chunks).strip()
+        if result:
+            return result
+        else:
+            raise Exception("pypdf extracted no text, trying pdfplumber")
+    except Exception as pypdf_exc:
+        print(f"pypdf extraction failed or empty: {pypdf_exc}, trying pdfplumber...")
+    
+    # Fallback to pdfplumber
+    try:
+        text_chunks: List[str] = []
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page_num, page in enumerate(pdf.pages):
+                try:
+                    text = page.extract_text() or ""
+                    if text.strip():
+                        text_chunks.append(text)
+                except Exception as exc:
+                    print(f"Warning: Failed to extract text from page {page_num} with pdfplumber: {exc}")
+                    continue
+        
+        result = "\n".join(text_chunks).strip()
+        if result:
+            return result
+        else:
+            raise Exception("pdfplumber also extracted no text")
+    except Exception as exc:
+        raise Exception(f"All PDF extraction methods failed: pypdf and pdfplumber both failed. Error: {str(exc)}")
 
 
 def normalize_subject_name(value: str) -> str:
@@ -263,7 +314,7 @@ Create a concise study plan using this structure exactly:
 Input data:
 - Subjects with exam data: {json.dumps(deadline_data)}
 - Time allocation proposal: {json.dumps(time_allocation)}
-- Weak subjects: {json.dumps(user_request.weak_subjects)}
+- Weak subjects: {json.dumps(user_request.weak_subjects if user_request.weak_subjects is not None else [])}
 - Syllabus text (optional): {json.dumps((user_request.syllabus_text or "")[:12000])}
 - Previous plan memory (optional): {json.dumps(prior_plan) if prior_plan else "null"}
 
@@ -298,10 +349,7 @@ Rules:
             continue
 
     if response is None:
-        raise HTTPException(
-            status_code=500,
-            detail=f"All Gemini model attempts failed. Last error: {last_error}",
-        )
+        raise Exception(f"All Gemini model attempts failed. Last error: {last_error}")
 
     raw = (response.text or "").strip()
 
@@ -311,16 +359,59 @@ Rules:
 
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=500, detail=f"Model returned non-JSON output: {exc}") from exc
+    except Exception as exc:
+        # Return the raw output for debugging
+        raise Exception(f"Model returned non-JSON output: {exc}. Raw output: {raw}")
     return data
 
 
 # -----------------------------
 # ReAct agent loop
 # -----------------------------
+def parse_subjects_from_timetable_text(timetable_text: str) -> List[SubjectInput]:
+    # Very basic parser: expects lines like "Subject Name - YYYY-MM-DD" or "Subject Name: DD/MM/YYYY"
+    import re
+    subjects = []
+    for line in timetable_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Try ISO format first
+        m = re.match(r"(.+)[-: ]+(\d{4}-\d{2}-\d{2})", line)
+        if m:
+            name, date_str = m.group(1).strip(), m.group(2)
+            try:
+                subjects.append(SubjectInput(name=name, exam_date=date.fromisoformat(date_str)))
+                continue
+            except Exception:
+                pass
+        # Try DD/MM/YYYY
+        m = re.match(r"(.+)[-: ]+(\d{2})/(\d{2})/(\d{4})", line)
+        if m:
+            name, day, month, year = m.group(1).strip(), m.group(2), m.group(3), m.group(4)
+            try:
+                subjects.append(SubjectInput(name=name, exam_date=date(int(year), int(month), int(day))))
+                continue
+            except Exception:
+                pass
+    return subjects
+
+
 def run_react_agent(request: PlanRequest) -> Dict[str, Any]:
     logs: List[Dict[str, str]] = []
+
+    # If no subjects but timetable_text is provided, try to parse subjects from timetable_text
+    subjects = request.subjects if request.subjects is not None else []
+    if not subjects and request.timetable_text:
+        logs.append({"step": "Thought", "content": "No subjects provided, attempting to parse from timetable_text."})
+        subjects = parse_subjects_from_timetable_text(request.timetable_text)
+        logs.append({"step": "Observation", "content": f"Parsed subjects from timetable_text: {subjects}"})
+    if not subjects:
+        raise HTTPException(status_code=400, detail="No subjects found in request or timetable PDF.")
+
+    # Ensure weak_subjects is always a list
+    weak_subjects = request.weak_subjects if request.weak_subjects is not None else []
+    hours_per_day = request.hours_per_day if request.hours_per_day is not None else 5
 
     # Step 1: Thought
     logs.append(
@@ -332,8 +423,12 @@ def run_react_agent(request: PlanRequest) -> Dict[str, Any]:
 
     # Step 2: Action (deadline analyzer)
     logs.append({"step": "Action", "content": "Run Deadline Analyzer Tool"})
-    deadline_data = deadline_analyzer_tool(request.subjects)
-    logs.append({"step": "Observation", "content": json.dumps(deadline_data)})
+    try:
+        deadline_data = deadline_analyzer_tool(subjects)
+        logs.append({"step": "Observation", "content": json.dumps(deadline_data)})
+    except Exception as exc:
+        logs.append({"step": "Error", "content": f"Deadline analyzer failed: {exc}"})
+        raise HTTPException(status_code=500, detail=f"Failed to analyze deadlines: {exc}")
 
     # Step 3: Thought
     logs.append(
@@ -345,8 +440,12 @@ def run_react_agent(request: PlanRequest) -> Dict[str, Any]:
 
     # Step 4: Action (time allocator)
     logs.append({"step": "Action", "content": "Run Study Time Allocator Tool"})
-    allocation = study_time_allocator_tool(deadline_data, request.hours_per_day, request.weak_subjects)
-    logs.append({"step": "Observation", "content": json.dumps(allocation)})
+    try:
+        allocation = study_time_allocator_tool(deadline_data, hours_per_day, weak_subjects)
+        logs.append({"step": "Observation", "content": json.dumps(allocation)})
+    except Exception as exc:
+        logs.append({"step": "Error", "content": f"Time allocator failed: {exc}"})
+        raise HTTPException(status_code=500, detail=f"Failed to allocate study time: {exc}")
 
     # Step 5: Thought
     logs.append(
@@ -361,8 +460,22 @@ def run_react_agent(request: PlanRequest) -> Dict[str, Any]:
     logs.append({"step": "Observation", "content": json.dumps(prior) if prior else "No previous plan"})
 
     # Step 6: Final answer via LLM
-    final_plan = call_gemini_for_plan(request, deadline_data, allocation, prior)
-    final_plan = canonicalize_final_plan(final_plan, [subject.name for subject in request.subjects], allocation)
+    try:
+        if not genai_client:
+            raise Exception("Gemini API client not initialized. Check GEMINI_API_KEY environment variable.")
+        final_plan = call_gemini_for_plan(request, deadline_data, allocation, prior)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logs.append({"step": "Error", "content": f"LLM error: {exc}"})
+        raise HTTPException(status_code=500, detail=f"AI plan generation failed: {exc}. Please check your API key and try again.")
+    
+    try:
+        final_plan = canonicalize_final_plan(final_plan, [subject.name for subject in subjects], allocation)
+    except Exception as exc:
+        logs.append({"step": "Error", "content": f"Plan canonicalization failed: {exc}"})
+        raise HTTPException(status_code=500, detail=f"Failed to format the generated plan: {exc}")
+    
     logs.append({"step": "Final Answer", "content": "Generated structured plan using Gemini."})
 
     result = {
@@ -393,6 +506,8 @@ def get_memory() -> Dict[str, Any]:
     return {"last_plan": data}
 
 
+
+# Syllabus PDF upload endpoint
 @app.post("/upload-syllabus")
 async def upload_syllabus(file: UploadFile = File(...)) -> Dict[str, Any]:
     if not file.filename or not file.filename.lower().endswith(".pdf"):
@@ -405,10 +520,10 @@ async def upload_syllabus(file: UploadFile = File(...)) -> Dict[str, Any]:
     try:
         extracted_text = extract_text_from_pdf_bytes(pdf_bytes)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not parse PDF: {exc}") from exc
+        raise HTTPException(status_code=400, detail=f"Could not parse PDF: {str(exc)}") from exc
 
-    if not extracted_text:
-        raise HTTPException(status_code=400, detail="No readable text found in PDF.")
+    if not extracted_text or extracted_text.strip() == "":
+        raise HTTPException(status_code=400, detail="No readable text found in PDF. The file may be scanned or encrypted. Please try a different PDF.")
 
     # Keep response compact for frontend.
     return {
@@ -417,9 +532,35 @@ async def upload_syllabus(file: UploadFile = File(...)) -> Dict[str, Any]:
         "syllabus_text": extracted_text[:12000],
     }
 
+# Timetable PDF upload endpoint
+@app.post("/upload-timetable")
+async def upload_timetable(file: UploadFile = File(...)) -> Dict[str, Any]:
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+
+    pdf_bytes = await file.read()
+    if len(pdf_bytes) == 0:
+        raise HTTPException(status_code=400, detail="Uploaded PDF is empty.")
+
+    try:
+        extracted_text = extract_text_from_pdf_bytes(pdf_bytes)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not parse PDF: {str(exc)}") from exc
+
+    if not extracted_text or extracted_text.strip() == "":
+        raise HTTPException(status_code=400, detail="No readable text found in PDF. The file may be scanned or encrypted. Please try a different PDF.")
+
+    # Keep response compact for frontend.
+    return {
+        "filename": file.filename,
+        "characters_extracted": len(extracted_text),
+        "timetable_text": extracted_text[:12000],
+    }
+
 
 @app.post("/plan")
 def generate_plan(request: PlanRequest) -> Dict[str, Any]:
-    if not request.subjects:
-        raise HTTPException(status_code=400, detail="At least one subject is required.")
+    # Allow plan generation if either manual subjects or timetable_text is present
+    if (not request.subjects or len(request.subjects) == 0) and (not request.timetable_text or request.timetable_text.strip() == ""):
+        raise HTTPException(status_code=400, detail="Please provide at least one subject or upload a timetable PDF.")
     return run_react_agent(request)
