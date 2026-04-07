@@ -179,16 +179,14 @@ const buildSubjectReasoning = ({
       reasoningParts.push(`Exam is scheduled for ${formattedExamDate}.`)
     } else if (daysLeft < 0) {
       reasoningParts.push(
-        `${subjectName} had an exam on ${formattedExamDate}, which is ${Math.abs(daysLeft)} day${
-          Math.abs(daysLeft) === 1 ? '' : 's'
+        `${subjectName} had an exam on ${formattedExamDate}, which is ${Math.abs(daysLeft)} day${Math.abs(daysLeft) === 1 ? '' : 's'
         } ago.`,
       )
     } else if (daysLeft === 0) {
       reasoningParts.push(`${subjectName} has its exam today (${formattedExamDate}), so it needs immediate revision.`)
     } else {
       reasoningParts.push(
-        `${subjectName} has its exam on ${formattedExamDate} with ${daysLeft} day${
-          daysLeft === 1 ? '' : 's'
+        `${subjectName} has its exam on ${formattedExamDate} with ${daysLeft} day${daysLeft === 1 ? '' : 's'
         } left, so its urgency is ${urgency}.`,
       )
     }
@@ -361,17 +359,107 @@ function App() {
   const [selectedPdfName, setSelectedPdfName] = useState('')
   const [selectedPdfFile, setSelectedPdfFile] = useState<File | null>(null)
   const [syllabusText, setSyllabusText] = useState('')
+  // Timetable PDF state
+  const [selectedTimetablePdfName, setSelectedTimetablePdfName] = useState('')
+  const [selectedTimetablePdfFile, setSelectedTimetablePdfFile] = useState<File | null>(null)
+  const [timetableText, setTimetableText] = useState('')
   const [subjectName, setSubjectName] = useState('')
   const [examDate, setExamDate] = useState('')
-  const [hoursPerDay, setHoursPerDay] = useState(5)
+  // Move hoursPerDay and weakSubjectsText to top-level required section
+  const [hoursPerDay, setHoursPerDay] = useState<number | ''>('')
   const [weakSubjectsText, setWeakSubjectsText] = useState('')
   const [subjects, setSubjects] = useState<Subject[]>([])
   const [loading, setLoading] = useState(false)
   const [uploadingPdf, setUploadingPdf] = useState(false)
+  const [uploadingTimetablePdf, setUploadingTimetablePdf] = useState(false)
   const [error, setError] = useState('')
   const [plan, setPlan] = useState<PlanResponse | null>(null)
 
   const apiBase = useMemo(() => import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000', [])
+
+  const uploadSyllabusPdf = async (): Promise<string> => {
+    if (!selectedPdfFile) return ''
+    setUploadingPdf(true)
+    try {
+      const formData = new FormData()
+      formData.append('file', selectedPdfFile)
+      const res = await fetch(`${apiBase}/upload-syllabus`, {
+        method: 'POST',
+        body: formData,
+      })
+      if (!res.ok) {
+        const errText = await res.text()
+        try {
+          const errJson = JSON.parse(errText)
+          const detail = errJson.detail || errText || 'Failed to upload syllabus PDF'
+          throw new Error(`📄 Syllabus PDF Error: ${detail}`)
+        } catch (e) {
+          if (e instanceof Error && e.message.includes('Syllabus PDF Error')) {
+            throw e
+          }
+          throw new Error(`📄 Syllabus PDF Error: ${errText || `Status ${res.status}`}`)
+        }
+      }
+      const data = (await res.json()) as { syllabus_text: string; filename: string; characters_extracted: number }
+      console.log(`✅ Syllabus extracted: ${data.characters_extracted} characters`)
+      setSyllabusText(data.syllabus_text)
+      return data.syllabus_text
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : 'Failed to upload syllabus PDF.'
+      setError(errMsg)
+      return ''
+    } finally {
+      setUploadingPdf(false)
+    }
+  }
+
+  const uploadTimetablePdf = async (): Promise<string> => {
+    if (!selectedTimetablePdfFile) return ''
+    setUploadingTimetablePdf(true)
+    try {
+      const formData = new FormData()
+      formData.append('file', selectedTimetablePdfFile)
+      const res = await fetch(`${apiBase}/upload-timetable`, {
+        method: 'POST',
+        body: formData,
+      })
+      if (!res.ok) {
+        const errText = await res.text()
+        try {
+          const errJson = JSON.parse(errText)
+          const detail = errJson.detail || errText || 'Failed to upload timetable PDF'
+          throw new Error(`📅 Timetable PDF Error: ${detail}`)
+        } catch (e) {
+          if (e instanceof Error && e.message.includes('Timetable PDF Error')) {
+            throw e
+          }
+          throw new Error(`📅 Timetable PDF Error: ${errText || `Status ${res.status}`}`)
+        }
+      }
+      const data = (await res.json()) as { timetable_text: string; filename: string; characters_extracted: number }
+      console.log(`✅ Timetable extracted: ${data.characters_extracted} characters`)
+      setTimetableText(data.timetable_text)
+      return data.timetable_text
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : 'Failed to upload timetable PDF.'
+      setError(errMsg)
+      return ''
+    } finally {
+      setUploadingTimetablePdf(false)
+    }
+  }
+
+  const clearSelectedPdf = () => {
+    setSelectedPdfName('')
+    setSelectedPdfFile(null)
+    setSyllabusText('')
+  }
+
+  const clearSelectedTimetablePdf = () => {
+    setSelectedTimetablePdfName('')
+    setSelectedTimetablePdfFile(null)
+    setTimetableText('')
+  }
 
   const handleAddSubject = () => {
     if (!subjectName.trim() || !examDate) return
@@ -396,76 +484,101 @@ function App() {
     setExamDate('')
   }
 
-  const clearSelectedPdf = () => {
-    setSelectedPdfName('')
-    setSelectedPdfFile(null)
-    setSyllabusText('')
-    const inputEl = document.getElementById('syllabus-input') as HTMLInputElement | null
-    if (inputEl) inputEl.value = ''
-  }
-
-  const uploadSyllabusPdf = async (): Promise<string> => {
-    if (!selectedPdfFile) return ''
-    setUploadingPdf(true)
-    try {
-      const formData = new FormData()
-      formData.append('file', selectedPdfFile)
-
-      const res = await fetch(`${apiBase}/upload-syllabus`, {
-        method: 'POST',
-        body: formData,
-      })
-
-      if (!res.ok) {
-        const errText = await res.text()
-        throw new Error(errText || `PDF upload failed with status ${res.status}`)
-      }
-
-      const data = (await res.json()) as { syllabus_text?: string }
-      const extracted = data.syllabus_text ?? ''
-      setSyllabusText(extracted)
-      return extracted
-    } finally {
-      setUploadingPdf(false)
-    }
-  }
-
   const handleGeneratePlan = async () => {
-    if (subjects.length === 0) {
-      setError('Please add at least one subject and exam date.')
+    // Flexible validation: Allow plan if we have subjects (manual or from PDF) OR we have timetable PDF
+    if (subjects.length === 0 && !timetableText && !selectedTimetablePdfFile) {
+      setError('❌ Please add at least one subject (manually or via PDF) to generate a plan.')
       return
     }
+
+    // Optional but recommended: warn if missing hours/day or weak subjects
+    if (hoursPerDay === '') {
+      setError('⚠️ Hours per day is recommended. Using default 5 hours/day.')
+    }
+    if (!weakSubjectsText.trim()) {
+      setError('⚠️ No weak subjects specified. Plan will not prioritize specific areas.')
+    }
+
+    // Check if timetable PDF was uploaded but hasn't been extracted yet
+    if (selectedTimetablePdfFile && !timetableText) {
+      setError('⚠️ Timetable PDF selected but not extracted yet. Please wait for extraction or upload again.')
+      return
+    }
+
     setError('')
     setLoading(true)
     setPlan(null)
 
+    let extractedSyllabusText = syllabusText
+    let extractedTimetableText = timetableText
+    let finalSubjects = [...subjects]
+
     try {
-      const extractedSyllabusText = selectedPdfFile ? await uploadSyllabusPdf() : syllabusText
+      if (selectedPdfFile && !syllabusText) {
+        console.log('📄 Uploading syllabus PDF...')
+        extractedSyllabusText = await uploadSyllabusPdf()
+        console.log('✅ Syllabus extracted:', extractedSyllabusText.length, 'characters')
+      }
+
+      if (selectedTimetablePdfFile && !timetableText) {
+        console.log('📄 Uploading timetable PDF...')
+        extractedTimetableText = await uploadTimetablePdf()
+        console.log('✅ Timetable extracted:', extractedTimetableText.length, 'characters')
+      }
+
       const weakSubjects = weakSubjectsText
         .split(',')
         .map((s) => s.trim())
         .filter(Boolean)
 
+      if (uploadingTimetablePdf) {
+        setError('⏳ Timetable PDF is still being parsed. Please wait for extraction to finish.')
+        setLoading(false)
+        return
+      }
+
+      // Debug: log what we're sending
+      const requestPayload = {
+        subjects: finalSubjects,
+        hours_per_day: hoursPerDay === '' ? null : Number(hoursPerDay),
+        weak_subjects: weakSubjects,
+        syllabus_text: extractedSyllabusText,
+        timetable_text: extractedTimetableText,
+      }
+      console.log('📤 Sending request to backend:', requestPayload)
+
       const res = await fetch(`${apiBase}/plan`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          subjects,
-          hours_per_day: Number(hoursPerDay),
-          weak_subjects: weakSubjects,
-          syllabus_text: extractedSyllabusText,
-        }),
+        body: JSON.stringify(requestPayload),
       })
 
       if (!res.ok) {
         const errText = await res.text()
-        throw new Error(errText || `Request failed with status ${res.status}`)
+        try {
+          const errJson = JSON.parse(errText)
+          let errorMsg = errJson.detail || errText || `Request failed with status ${res.status}`
+
+          // Provide better error messages for common issues
+          if (errorMsg.includes('No subjects found')) {
+            errorMsg = '❌ No subjects found. Please:\n1. Add subjects manually (Subject + Exam Date), OR\n2. Upload a timetable PDF with exam dates'
+          } else if (errorMsg.includes('Input should be greater than 0')) {
+            errorMsg = '❌ Hours per day must be greater than 0. Enter a value between 1-24.'
+          }
+
+          throw new Error(errorMsg)
+        } catch (e) {
+          throw new Error(errText || `Request failed with status ${res.status}. Make sure the backend is running at ${apiBase}`)
+        }
       }
 
       const data = (await res.json()) as PlanResponse
       setPlan(data)
+
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to connect to backend.')
+      const errorMessage = err instanceof Error ? err.message : 'Failed to connect to backend.'
+      console.error('Plan generation error:', errorMessage)
+      setError(errorMessage)
     } finally {
       setLoading(false)
     }
@@ -485,6 +598,20 @@ function App() {
 
   const handleLaunchPlannerConsole = () => {
     document.getElementById('planner-console')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
+
+  const checkBackendHealth = async () => {
+    try {
+      const res = await fetch(`${apiBase}/`)
+      if (res.ok) {
+        const data = await res.json()
+        alert(`✅ Backend is running:\n${JSON.stringify(data, null, 2)}`)
+      } else {
+        alert(`❌ Backend responded with status ${res.status}`)
+      }
+    } catch (err) {
+      alert(`❌ Cannot connect to backend at ${apiBase}\n\nMake sure:\n1. Backend is running (python main.py in /backend)\n2. API endpoint is correct: ${apiBase}`)
+    }
   }
 
   const handleDownloadSampleCsv = () => {
@@ -514,6 +641,9 @@ function App() {
           <button className="btn btn-secondary" onClick={handleDownloadSampleCsv}>
             View Sample CSV
           </button>
+          <button className="btn btn-secondary" onClick={checkBackendHealth}>
+            Check Backend Status
+          </button>
         </div>
 
         <section className="stats-grid" aria-label="Planner stats">
@@ -527,6 +657,108 @@ function App() {
       </header>
 
       <main className="content-grid">
+        {/* Required Study Preferences Section */}
+        <section className="panel" style={{ marginBottom: 24 }}>
+          <div className="panel-head">
+            <h2>Personalize Your Plan <span className="required-asterisk">*</span></h2>
+          </div>
+          <div className="form-row" style={{ display: 'flex', flexWrap: 'wrap', gap: 24, alignItems: 'flex-end' }}>
+            <div>
+              <label htmlFor="hours-day" className="form-label">
+                Hours / Day <span className="required-asterisk">*</span>
+              </label>
+              <input
+                id="hours-day"
+                type="number"
+                min="1"
+                max="24"
+                required
+                value={hoursPerDay}
+                onChange={(e) => setHoursPerDay(e.target.value === '' ? '' : Number(e.target.value))}
+                className="form-input"
+                style={{ width: 80 }}
+              />
+              <div className="form-helper-text">
+                How many hours can you study per day?
+              </div>
+            </div>
+            <div>
+              <label htmlFor="weak-subjects" className="form-label">
+                Weak Subjects <span className="required-asterisk">*</span>
+              </label>
+              <input
+                id="weak-subjects"
+                type="text"
+                required
+                placeholder="e.g. Math, Physics"
+                value={weakSubjectsText}
+                onChange={(e) => setWeakSubjectsText(e.target.value)}
+                className="form-input"
+                style={{ minWidth: 200 }}
+              />
+              <div className="form-helper-text">
+                List subjects you struggle with (comma separated)
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section className="panel">
+          <div className="panel-head">
+            <h2>Manual Subject Entry (Optional)</h2>
+          </div>
+          <p>Add subjects and exam dates manually if you prefer not to use PDFs.</p>
+          <div className="form-row" style={{ display: 'flex', flexWrap: 'wrap', gap: 24, alignItems: 'flex-end' }}>
+            <div>
+              <label htmlFor="subject-name" className="form-label">
+                Subject Name
+              </label>
+              <input
+                id="subject-name"
+                type="text"
+                placeholder="e.g. Mathematics"
+                value={subjectName}
+                onChange={(e) => setSubjectName(e.target.value)}
+                className="form-input"
+                style={{ minWidth: 200 }}
+              />
+            </div>
+            <div>
+              <label htmlFor="exam-date" className="form-label">
+                Exam Date
+              </label>
+              <input
+                id="exam-date"
+                type="date"
+                value={examDate}
+                onChange={(e) => setExamDate(e.target.value)}
+                className="form-input"
+                style={{ minWidth: 150 }}
+              />
+            </div>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={handleAddSubject}
+              disabled={!subjectName.trim() || !examDate}
+            >
+              Add Subject
+            </button>
+          </div>
+          {subjects.length > 0 && (
+            <div style={{ marginTop: '1rem' }}>
+              <strong>Added subjects:</strong>
+              <ul style={{ marginTop: '0.5rem' }}>
+                {subjects.map((s) => (
+                  <li key={`${s.name}-${s.exam_date}`}>
+                    {s.name} - {formatExamDate(s.exam_date)}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </section>
+
         <section className="panel upload-panel">
           <div className="panel-head">
             <h2>Syllabus Ingestion</h2>
@@ -567,61 +799,46 @@ function App() {
           )}
         </section>
 
-        <section className="panel timetable-panel">
+        <section className="panel upload-panel">
           <div className="panel-head">
-            <h2>Exam Timetable Sync</h2>
-            <span className="badge">DATES</span>
+            <h2>Timetable Ingestion</h2>
+            <span className="badge">PDF</span>
           </div>
-          <p>Enter your exam slots so the planner can auto-balance revisions and rest windows.</p>
-          <form className="timetable-form">
-            <div>
-              <label htmlFor="subject">Subject</label>
-              <input
-                id="subject"
-                type="text"
-                placeholder="Applied Mathematics"
-                value={subjectName}
-                onChange={(e) => setSubjectName(e.target.value)}
-              />
-            </div>
-            <div>
-              <label htmlFor="exam-date">Exam Date</label>
-              <input id="exam-date" type="date" value={examDate} onChange={(e) => setExamDate(e.target.value)} />
-            </div>
-            <div>
-              <label htmlFor="hours-day">Hours / Day</label>
-              <input
-                id="hours-day"
-                type="number"
-                min="1"
-                max="24"
-                value={hoursPerDay}
-                onChange={(e) => setHoursPerDay(Number(e.target.value))}
-              />
-            </div>
-            <button type="button" className="btn btn-small" onClick={handleAddSubject}>
-              Add Exam Node
-            </button>
-          </form>
-          <div style={{ marginTop: '0.75rem' }}>
-            <label htmlFor="weak-subjects">Weak Subjects (comma separated)</label>
+          <p>Drag and drop your exam timetable PDF to auto-extract exam dates and subjects.</p>
+          <label className="drop-zone" htmlFor="timetable-input">
             <input
-              id="weak-subjects"
-              type="text"
-              placeholder="Math, Physics"
-              value={weakSubjectsText}
-              onChange={(e) => setWeakSubjectsText(e.target.value)}
+              id="timetable-input"
+              type="file"
+              accept=".pdf"
+              onChange={(e) => {
+                const file = e.target.files?.[0]
+                setSelectedTimetablePdfName(file ? file.name : '')
+                setSelectedTimetablePdfFile(file ?? null)
+                setTimetableText('')
+              }}
             />
-          </div>
-          {subjects.length > 0 && (
-            <div style={{ marginTop: '0.75rem' }}>
-              <strong>Added subjects:</strong>
-              {subjects.map((s) => (
-                <p key={`${s.name}-${s.exam_date}`}>
-                  {s.name} - {s.exam_date}
-                </p>
-              ))}
-            </div>
+            <strong>Drop PDF Here</strong>
+            <span>or tap to browse local files</span>
+          </label>
+          {selectedTimetablePdfName && (
+            <p style={{ marginTop: '0.5rem' }}>
+              Selected PDF: <strong>{selectedTimetablePdfName}</strong>
+              <button
+                type="button"
+                className="btn btn-small"
+                style={{ marginLeft: '0.75rem' }}
+                onClick={clearSelectedTimetablePdf}
+              >
+                Remove PDF
+              </button>
+            </p>
+          )}
+          {uploadingTimetablePdf && <p style={{ marginTop: '0.5rem', color: '#ffa500' }}>Extracting timetable from PDF... Please wait.</p>}
+          {!uploadingTimetablePdf && timetableText === '' && selectedTimetablePdfFile && (
+            <p style={{ marginTop: '0.5rem', color: '#ffa500' }}>Timetable PDF uploaded. Awaiting extraction or parsing failed.</p>
+          )}
+          {!!timetableText && !uploadingTimetablePdf && (
+            <p style={{ marginTop: '0.5rem', color: '#7fffd4' }}>PDF parsed and included in planning.</p>
           )}
         </section>
 
