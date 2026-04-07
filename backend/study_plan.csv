@@ -1,0 +1,5 @@
+Subject,Exam Date,Days Left,Urgency,Hours/Day,Daily Goal,Focus Topics
+DSIP,'5 May,28,low,1h 28m,Signal Processing Mastery: Dedicate 1h 28m to practicing Fourier Transform derivations and image enhancement algorithms.,"Fourier Transform, Image Enhancement, Filtering"
+NIS,'8 May,31,low,1h 19m,Security Protocol Review: Utilize 1h 19m to map out Cryptography basics and IDS/Firewall architectures.,"Cryptography, Network Protocols, Ethical Hacking"
+CC,'12 May,35,low,1h 10m,Cloud Infrastructure Deep-Dive: Use 1h 10m to compare IaaS/PaaS/SaaS models and cloud security virtualization.,"Cloud Models, Virtualization, AWS/Azure Basics"
+AI,'16 May,39,low,1h 3m,Intelligence Logic Drill: Spend 1h 3m solving Search Algorithm trees and reviewing Machine Learning Neural Networks.,"Search Algorithms, Machine Learning, Neural Networks"

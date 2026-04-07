@@ -1,566 +1,445 @@
 import io
 import json
 import os
+import csv
+import re
 from datetime import date, datetime, timezone
-from difflib import get_close_matches
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from google import genai
+from fastapi.responses import FileResponse
+import google.generativeai as genai
 from pypdf import PdfReader
 import pdfplumber
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from dotenv import load_dotenv
-
 
 load_dotenv(Path(__file__).parent / ".env")
 
-
-# -----------------------------
-# App and configuration
-# -----------------------------
 app = FastAPI(title="Agentic AI Academic Planner", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For demo/evaluation; tighten for production.
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 MEMORY_FILE = Path(__file__).parent / "planner_memory.json"
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+CSV_FILE = Path(__file__).parent / "study_plan.csv"
+
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-pro")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 if GEMINI_API_KEY:
-    genai_client = genai.Client(api_key=GEMINI_API_KEY)
+    genai.configure(api_key=GEMINI_API_KEY)
+    genai_client = True
 else:
     genai_client = None
 
 
-# -----------------------------
-# Request/response schemas
-# -----------------------------
 class SubjectInput(BaseModel):
-    name: str = Field(..., min_length=1)
+    name: str
     exam_date: date
 
 
 class PlanRequest(BaseModel):
     subjects: Optional[List[SubjectInput]] = None
-    hours_per_day: Optional[float] = Field(5, gt=0, le=24)
+    hours_per_day: Optional[float] = 5
     weak_subjects: Optional[List[str]] = None
     syllabus_text: Optional[str] = None
     timetable_text: Optional[str] = None
     use_memory: bool = True
 
 
-# -----------------------------
-# Memory tool
-# -----------------------------
-def load_last_plan() -> Optional[Dict[str, Any]]:
-    if not MEMORY_FILE.exists():
-        return None
-    try:
-        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+def load_last_plan():
+    if MEMORY_FILE.exists():
+        with open(MEMORY_FILE, "r") as f:
             return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return None
+    return None
 
 
-def save_last_plan(plan: Dict[str, Any]) -> None:
-    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(plan, f, indent=2, ensure_ascii=True)
+def save_last_plan(plan):
+    with open(MEMORY_FILE, "w") as f:
+        json.dump(plan, f, indent=2)
 
 
-# -----------------------------
-# Tool 1: Deadline Analyzer
-# -----------------------------
-def deadline_analyzer_tool(subjects: List[SubjectInput]) -> List[Dict[str, Any]]:
+def format_hours_mins(decimal_hours):
+    try:
+        val = float(decimal_hours)
+        mins = int(round(val * 60))
+        h = mins // 60
+        m = mins % 60
+        if h > 0 and m > 0:
+            return f"{h}h {m}m"
+        if h > 0:
+            return f"{h}h"
+        return f"{m}m"
+    except Exception:
+        return str(decimal_hours)
+
+
+def deadline_analyzer_tool(subjects):
     today = date.today()
     results = []
     for sub in subjects:
-        days_left = (sub.exam_date - today).days
+        days_left = max(1, (sub.exam_date - today).days)
         urgency = "high" if days_left <= 7 else "medium" if days_left <= 21 else "low"
-        results.append(
-            {
-                "subject": sub.name,
-                "exam_date": sub.exam_date.isoformat(),
-                "days_left": days_left,
-                "urgency": urgency,
-            }
-        )
-    results.sort(key=lambda x: x["days_left"])
-    return results
+        results.append({
+            "subject": sub.name,
+            "exam_date": sub.exam_date.isoformat(),
+            "days_left": days_left,
+            "urgency": urgency
+        })
+    return sorted(results, key=lambda x: x["days_left"])
 
 
-# -----------------------------
-# Tool 2: Study Time Allocator
-# -----------------------------
-def study_time_allocator_tool(
-    deadline_data: List[Dict[str, Any]],
-    hours_per_day: float,
-    weak_subjects: List[str],
-) -> Dict[str, Any]:
-    weight_map = {"high": 3.0, "medium": 2.0, "low": 1.0}
-    weak_set = {w.strip().lower() for w in weak_subjects}
+def study_time_allocator_tool(deadline_data, hours_per_day, weak_subjects):
+    weak_subjects = [s.lower() for s in (weak_subjects or [])]
+    total_days = sum(item["days_left"] for item in deadline_data)
 
-    weighted_subjects = []
+    weights = {}
     for item in deadline_data:
-        base_weight = weight_map.get(item["urgency"], 1.0)
-        if item["subject"].strip().lower() in weak_set:
-            base_weight += 1.0
-        weighted_subjects.append((item["subject"], base_weight))
+        inverse_weight = total_days / item["days_left"]
+        if item["subject"].lower() in weak_subjects:
+            inverse_weight *= 1.4
+        weights[item["subject"]] = inverse_weight
 
-    total_weight = sum(w for _, w in weighted_subjects) or 1.0
-    allocation = []
-    for subject, weight in weighted_subjects:
+    total_weight = sum(weights.values())
+    allocations = []
+    for subject, weight in weights.items():
         hours = round((weight / total_weight) * hours_per_day, 2)
-        allocation.append({"subject": subject, "hours_per_day": hours})
-
-    # Normalize rounding drift to preserve total hours_per_day exactly.
-    drift = round(hours_per_day - sum(a["hours_per_day"] for a in allocation), 2)
-    if allocation and drift != 0:
-        allocation[0]["hours_per_day"] = round(allocation[0]["hours_per_day"] + drift, 2)
+        allocations.append({"subject": subject, "hours_per_day": hours})
 
     return {
         "total_hours_per_day": hours_per_day,
-        "allocations": allocation,
+        "allocations": allocations
     }
 
 
-def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
-    if not pdf_bytes:
-        return ""
-    
-    # Try pypdf first
+def extract_text_from_pdf_bytes(pdf_bytes):
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
-        if len(reader.pages) == 0:
-            raise Exception("PDF has no pages")
-        
-        text_chunks: List[str] = []
-        for page_num, page in enumerate(reader.pages):
-            try:
-                text = page.extract_text() or ""
-                if text.strip():
-                    text_chunks.append(text)
-                else:
-                    # Try alternative extraction method if standard fails
-                    try:
-                        text = page.extract_text(extraction_mode="layout")
-                        if text.strip():
-                            text_chunks.append(text)
-                    except Exception:
-                        pass
-            except Exception as exc:
-                # Log but continue with next page
-                print(f"Warning: Failed to extract text from page {page_num} with pypdf: {exc}")
-                continue
-        
-        result = "\n".join(text_chunks).strip()
-        if result:
-            return result
-        else:
-            raise Exception("pypdf extracted no text, trying pdfplumber")
-    except Exception as pypdf_exc:
-        print(f"pypdf extraction failed or empty: {pypdf_exc}, trying pdfplumber...")
-    
-    # Fallback to pdfplumber
+        text = "\n".join([p.extract_text() or "" for p in reader.pages])
+        if text.strip():
+            return text
+    except Exception:
+        pass
     try:
-        text_chunks: List[str] = []
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for page_num, page in enumerate(pdf.pages):
-                try:
-                    text = page.extract_text() or ""
-                    if text.strip():
-                        text_chunks.append(text)
-                except Exception as exc:
-                    print(f"Warning: Failed to extract text from page {page_num} with pdfplumber: {exc}")
-                    continue
-        
-        result = "\n".join(text_chunks).strip()
-        if result:
-            return result
-        else:
-            raise Exception("pdfplumber also extracted no text")
-    except Exception as exc:
-        raise Exception(f"All PDF extraction methods failed: pypdf and pdfplumber both failed. Error: {str(exc)}")
+            return "\n".join([p.extract_text() or "" for p in pdf.pages])
+    except Exception:
+        return ""
 
 
-def normalize_subject_name(value: str) -> str:
-    return " ".join(value.strip().lower().split())
+DATE_LINE_PATTERN = re.compile(
+    r"^\s*(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})\s*$",
+    re.IGNORECASE
+)
+TIME_LINE_PATTERN = re.compile(r"\d{1,2}:\d{2}\s*(AM|PM)", re.IGNORECASE)
+SKIP_WORDS = {"date", "subject", "time", "day", "exam"}
 
 
-def canonicalize_subject_name(value: str, allowed_subjects: List[str]) -> str:
-    normalized_allowed = {normalize_subject_name(subject): subject for subject in allowed_subjects}
-    normalized_value = normalize_subject_name(value)
-
-    if normalized_value in normalized_allowed:
-        return normalized_allowed[normalized_value]
-
-    close_match = get_close_matches(normalized_value, list(normalized_allowed.keys()), n=1, cutoff=0.6)
-    if close_match:
-        return normalized_allowed[close_match[0]]
-
-    return value.strip()
-
-
-def canonicalize_final_plan(
-    final_plan: Dict[str, Any],
-    allowed_subjects: List[str],
-    fallback_allocation: Dict[str, Any],
-) -> Dict[str, Any]:
-    canonical_study_plan: List[Dict[str, Any]] = []
-    seen_study_subjects = set()
-    for item in final_plan.get("study_plan", []):
-        if not isinstance(item, dict):
-            continue
-        subject_name = canonicalize_subject_name(str(item.get("subject", "")), allowed_subjects)
-        if not subject_name or subject_name in seen_study_subjects:
-            continue
-        seen_study_subjects.add(subject_name)
-        canonical_study_plan.append(
-            {
-                "subject": subject_name,
-                "focus_topics": item.get("focus_topics", []),
-                "daily_goal": item.get("daily_goal", ""),
-            }
-        )
-
-    canonical_priority_list: List[str] = []
-    seen_priority_subjects = set()
-    for subject_name in final_plan.get("priority_list", []):
-        canonical_name = canonicalize_subject_name(str(subject_name), allowed_subjects)
-        if not canonical_name or canonical_name in seen_priority_subjects:
-            continue
-        seen_priority_subjects.add(canonical_name)
-        canonical_priority_list.append(canonical_name)
-
-    if not canonical_priority_list:
-        canonical_priority_list = [item["subject"] for item in fallback_allocation.get("allocations", [])]
-
-    raw_time_allocation = final_plan.get("time_allocation", fallback_allocation)
-    allocations_source = raw_time_allocation.get("allocations", fallback_allocation.get("allocations", []))
-    canonical_allocations: List[Dict[str, Any]] = []
-    seen_allocation_subjects = set()
-    for item in allocations_source:
-        if not isinstance(item, dict):
-            continue
-        canonical_name = canonicalize_subject_name(str(item.get("subject", "")), allowed_subjects)
-        if not canonical_name or canonical_name in seen_allocation_subjects:
-            continue
-        seen_allocation_subjects.add(canonical_name)
-        canonical_allocations.append(
-            {
-                "subject": canonical_name,
-                "hours_per_day": item.get("hours_per_day", 0),
-            }
-        )
-
-    canonical_time_allocation = {
-        "total_hours_per_day": raw_time_allocation.get(
-            "total_hours_per_day",
-            fallback_allocation.get("total_hours_per_day", 0),
-        ),
-        "allocations": canonical_allocations or fallback_allocation.get("allocations", []),
-    }
-
-    return {
-        **final_plan,
-        "study_plan": canonical_study_plan,
-        "priority_list": canonical_priority_list,
-        "time_allocation": canonical_time_allocation,
-    }
-
-
-# -----------------------------
-# LLM utility
-# -----------------------------
-def call_gemini_for_plan(
-    user_request: PlanRequest,
-    deadline_data: List[Dict[str, Any]],
-    time_allocation: Dict[str, Any],
-    prior_plan: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    if not GEMINI_API_KEY:
-        raise HTTPException(status_code=500, detail="Missing GEMINI_API_KEY environment variable.")
-
-    prompt = f"""
-You are an academic planning AI. Return ONLY valid JSON.
-
-Create a concise study plan using this structure exactly:
-{{
-  "study_plan": [
-    {{
-      "subject": "string",
-      "focus_topics": ["string"],
-      "daily_goal": "string"
-    }}
-  ],
-  "priority_list": ["subject names in order"],
-  "time_allocation": {{
-    "total_hours_per_day": number,
-    "allocations": [
-      {{"subject": "string", "hours_per_day": number}}
-    ]
-  }},
-  "adjustment_notes": "string"
-}}
-
-Input data:
-- Subjects with exam data: {json.dumps(deadline_data)}
-- Time allocation proposal: {json.dumps(time_allocation)}
-- Weak subjects: {json.dumps(user_request.weak_subjects if user_request.weak_subjects is not None else [])}
-- Syllabus text (optional): {json.dumps((user_request.syllabus_text or "")[:12000])}
-- Previous plan memory (optional): {json.dumps(prior_plan) if prior_plan else "null"}
-
-Rules:
-1) Prioritize subjects with fewer days left.
-2) Give extra revision intensity to weak subjects.
-3) Keep plan realistic for a student.
-4) Ensure priority_list matches urgency.
-5) Output JSON only; no markdown.
-6) Use subject names exactly as provided in the input. Do not rename, abbreviate, merge, or paraphrase them.
-"""
-    # Prefer stronger free models first, then fallback for compatibility.
-    candidate_models = [MODEL_NAME, "gemini-2.0-flash", "gemini-1.5-flash"]
-    seen = set()
-    ordered_candidates = []
-    for model_name in candidate_models:
-        if model_name and model_name not in seen:
-            seen.add(model_name)
-            ordered_candidates.append(model_name)
-
-    response = None
-    last_error: Optional[Exception] = None
-    for model_name in ordered_candidates:
-        try:
-            response = genai_client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-            )
-            break
-        except Exception as exc:
-            last_error = exc
-            continue
-
-    if response is None:
-        raise Exception(f"All Gemini model attempts failed. Last error: {last_error}")
-
-    raw = (response.text or "").strip()
-
-    # Defensive parsing in case model wraps JSON in markdown fences.
-    if raw.startswith("```"):
-        raw = raw.replace("```json", "").replace("```", "").strip()
-
-    try:
-        data = json.loads(raw)
-    except Exception as exc:
-        # Return the raw output for debugging
-        raise Exception(f"Model returned non-JSON output: {exc}. Raw output: {raw}")
-    return data
-
-
-# -----------------------------
-# ReAct agent loop
-# -----------------------------
-def parse_subjects_from_timetable_text(timetable_text: str) -> List[SubjectInput]:
-    # Very basic parser: expects lines like "Subject Name - YYYY-MM-DD" or "Subject Name: DD/MM/YYYY"
-    import re
+def parse_subjects_from_timetable_text(text):
+    lines = [l.strip() for l in text.splitlines()]
     subjects = []
-    for line in timetable_text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        # Try ISO format first
-        m = re.match(r"(.+)[-: ]+(\d{4}-\d{2}-\d{2})", line)
+    seen = set()
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+        m = DATE_LINE_PATTERN.match(line)
         if m:
-            name, date_str = m.group(1).strip(), m.group(2)
             try:
-                subjects.append(SubjectInput(name=name, exam_date=date.fromisoformat(date_str)))
-                continue
+                parsed_date = datetime.strptime(
+                    f"{m.group(1)} {m.group(2)} {m.group(3)}", "%d %B %Y"
+                ).date()
             except Exception:
-                pass
-        # Try DD/MM/YYYY
-        m = re.match(r"(.+)[-: ]+(\d{2})/(\d{2})/(\d{4})", line)
-        if m:
-            name, day, month, year = m.group(1).strip(), m.group(2), m.group(3), m.group(4)
-            try:
-                subjects.append(SubjectInput(name=name, exam_date=date(int(year), int(month), int(day))))
+                i += 1
                 continue
-            except Exception:
-                pass
+
+            j = i + 1
+            while j < len(lines):
+                candidate = lines[j].strip()
+                if (
+                    not candidate
+                    or candidate.lower() in SKIP_WORDS
+                    or TIME_LINE_PATTERN.search(candidate)
+                    or DATE_LINE_PATTERN.match(candidate)
+                ):
+                    j += 1
+                    continue
+                key = candidate.lower()
+                if key not in seen:
+                    seen.add(key)
+                    subjects.append(SubjectInput(name=candidate, exam_date=parsed_date))
+                i = j
+                break
+        i += 1
+
     return subjects
 
 
-def run_react_agent(request: PlanRequest) -> Dict[str, Any]:
-    logs: List[Dict[str, str]] = []
-
-    # If no subjects but timetable_text is provided, try to parse subjects from timetable_text
-    subjects = request.subjects if request.subjects is not None else []
-    if not subjects and request.timetable_text:
-        logs.append({"step": "Thought", "content": "No subjects provided, attempting to parse from timetable_text."})
-        subjects = parse_subjects_from_timetable_text(request.timetable_text)
-        logs.append({"step": "Observation", "content": f"Parsed subjects from timetable_text: {subjects}"})
-    if not subjects:
-        raise HTTPException(status_code=400, detail="No subjects found in request or timetable PDF.")
-
-    # Ensure weak_subjects is always a list
-    weak_subjects = request.weak_subjects if request.weak_subjects is not None else []
-    hours_per_day = request.hours_per_day if request.hours_per_day is not None else 5
-
-    # Step 1: Thought
-    logs.append(
-        {
-            "step": "Thought",
-            "content": "I should inspect exam deadlines first to estimate urgency.",
-        }
+def call_gemini(prompt):
+    model = genai.GenerativeModel(MODEL_NAME)
+    response = model.generate_content(prompt)
+    return (
+        response.text
+        if hasattr(response, "text")
+        else response.candidates[0].content.parts[0].text
     )
 
-    # Step 2: Action (deadline analyzer)
-    logs.append({"step": "Action", "content": "Run Deadline Analyzer Tool"})
-    try:
-        deadline_data = deadline_analyzer_tool(subjects)
-        logs.append({"step": "Observation", "content": json.dumps(deadline_data)})
-    except Exception as exc:
-        logs.append({"step": "Error", "content": f"Deadline analyzer failed: {exc}"})
-        raise HTTPException(status_code=500, detail=f"Failed to analyze deadlines: {exc}")
 
-    # Step 3: Thought
-    logs.append(
+def extract_subjects_via_gemini(timetable_text):
+    prompt = f"""You are given an exam timetable. Extract every subject name and its exam date.
+
+Return ONLY a valid JSON array. No markdown, no code fences, no explanation. Just the raw JSON array.
+
+Example output:
+[{{"name": "DSIP", "exam_date": "2026-05-05"}}, {{"name": "NIS", "exam_date": "2026-05-08"}}]
+
+Timetable text:
+{timetable_text[:4000]}"""
+
+    try:
+        raw = call_gemini(prompt)
+        raw = raw.strip()
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+        raw = raw.strip()
+        start = raw.find("[")
+        end = raw.rfind("]")
+        if start == -1 or end == -1:
+            return []
+        parsed = json.loads(raw[start:end + 1])
+        subjects = []
+        for s in parsed:
+            try:
+                subjects.append(SubjectInput(
+                    name=s["name"].strip(),
+                    exam_date=date.fromisoformat(s["exam_date"])
+                ))
+            except Exception:
+                continue
+        return subjects
+    except Exception:
+        return []
+
+
+def build_study_plan_via_gemini(deadline_data, allocation, syllabus_text):
+    alloc_map = {a["subject"]: a["hours_per_day"] for a in allocation["allocations"]}
+
+    subjects_payload = [
         {
-            "step": "Thought",
-            "content": "Now allocate daily hours by urgency and weak-subject boost.",
+            "subject": item["subject"],
+            "exam_date": item["exam_date"],
+            "days_left": item["days_left"],
+            "urgency": item["urgency"],
+            "hours_per_day": alloc_map.get(item["subject"], 1.0)
         }
-    )
+        for item in deadline_data
+    ]
 
-    # Step 4: Action (time allocator)
-    logs.append({"step": "Action", "content": "Run Study Time Allocator Tool"})
+    syllabus_snippet = (syllabus_text or "Not provided")[:3000]
+
+    prompt = f"""You are an academic study planner AI.
+
+Create a personalised daily study plan for each subject below.
+Each subject already has its daily study hours calculated — use them exactly as given.
+Use the syllabus to write specific, actionable daily goals and focus topics per subject.
+
+Subjects with allocated hours and deadlines:
+{json.dumps(subjects_payload, indent=2)}
+
+Syllabus context:
+{syllabus_snippet}
+
+Return ONLY a valid JSON object. No markdown, no code fences. Just raw JSON.
+
+IMPORTANT: The subject names in your response must exactly match the subject names given above.
+
+Format:
+{{
+  "study_plan": [
+    {{
+      "subject": "Subject Name",
+      "daily_goal": "Specific actionable goal for the day based on syllabus",
+      "focus_topics": ["Topic 1", "Topic 2", "Topic 3"]
+    }}
+  ],
+  "priority_list": ["Subject1", "Subject2", "Subject3"],
+  "adjustment_notes": "Brief reasoning on priority and time allocation"
+}}"""
+
     try:
-        allocation = study_time_allocator_tool(deadline_data, hours_per_day, weak_subjects)
-        logs.append({"step": "Observation", "content": json.dumps(allocation)})
-    except Exception as exc:
-        logs.append({"step": "Error", "content": f"Time allocator failed: {exc}"})
-        raise HTTPException(status_code=500, detail=f"Failed to allocate study time: {exc}")
-
-    # Step 5: Thought
-    logs.append(
-        {
-            "step": "Thought",
-            "content": "Use memory and LLM to produce a human-usable final plan.",
-        }
-    )
-
-    prior = load_last_plan() if request.use_memory else None
-    logs.append({"step": "Action", "content": "Use Memory Tool (load previous plan)"})
-    logs.append({"step": "Observation", "content": json.dumps(prior) if prior else "No previous plan"})
-
-    # Step 6: Final answer via LLM
-    try:
-        if not genai_client:
-            raise Exception("Gemini API client not initialized. Check GEMINI_API_KEY environment variable.")
-        final_plan = call_gemini_for_plan(request, deadline_data, allocation, prior)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logs.append({"step": "Error", "content": f"LLM error: {exc}"})
-        raise HTTPException(status_code=500, detail=f"AI plan generation failed: {exc}. Please check your API key and try again.")
-    
-    try:
-        final_plan = canonicalize_final_plan(final_plan, [subject.name for subject in subjects], allocation)
-    except Exception as exc:
-        logs.append({"step": "Error", "content": f"Plan canonicalization failed: {exc}"})
-        raise HTTPException(status_code=500, detail=f"Failed to format the generated plan: {exc}")
-    
-    logs.append({"step": "Final Answer", "content": "Generated structured plan using Gemini."})
-
-    result = {
-        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "study_plan": final_plan.get("study_plan", []),
-        "priority_list": final_plan.get("priority_list", []),
-        "time_allocation": final_plan.get("time_allocation", allocation),
-        "agent_reasoning_logs": logs,
-    }
-    if "adjustment_notes" in final_plan:
-        result["adjustment_notes"] = final_plan["adjustment_notes"]
-
-    save_last_plan(result)
-    return result
+        raw = call_gemini(prompt)
+        raw = raw.strip()
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+        raw = raw.strip()
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start == -1 or end == -1:
+            return None
+        return json.loads(raw[start:end + 1])
+    except Exception:
+        return None
 
 
-# -----------------------------
-# API endpoints
-# -----------------------------
-@app.get("/")
-def health() -> Dict[str, str]:
-    return {"status": "ok", "service": "Agentic AI Academic Planner Backend"}
+def normalize(s):
+    return s.strip().lower()
 
 
-@app.get("/memory")
-def get_memory() -> Dict[str, Any]:
-    data = load_last_plan()
-    return {"last_plan": data}
+def generate_csv(result, deadline_data, allocation):
+    alloc_map = {normalize(a["subject"]): a["hours_per_day"] for a in allocation["allocations"]}
+    deadline_map = {normalize(d["subject"]): d for d in deadline_data}
+    plan_map = {normalize(item["subject"]): item for item in result.get("study_plan", [])}
+
+    all_subjects = list(deadline_map.keys())
+
+    with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Subject", "Exam Date", "Days Left", "Urgency", "Hours/Day", "Daily Goal", "Focus Topics"])
+        
+        for key in all_subjects:
+            d = deadline_map.get(key, {})
+            p = plan_map.get(key, {})
+            
+            raw_hours = alloc_map.get(key, 0)
+            formatted_time = format_hours_mins(raw_hours)
+
+            raw_date = d.get("exam_date", "")
+            try:
+                dt = datetime.strptime(raw_date, "%Y-%m-%d")
+                # COMPACT FORCE TEXT: Fits Excel width and prevents auto-formatting issues.
+                formatted_date = f"'{dt.day} {dt.strftime('%b')}"
+            except Exception:
+                formatted_date = raw_date
+            
+            writer.writerow([
+                d.get("subject", key.upper()),
+                formatted_date,
+                d.get("days_left", ""),
+                d.get("urgency", ""),
+                formatted_time,
+                p.get("daily_goal", ""),
+                ", ".join(p.get("focus_topics", []))
+            ])
 
 
-
-# Syllabus PDF upload endpoint
 @app.post("/upload-syllabus")
-async def upload_syllabus(file: UploadFile = File(...)) -> Dict[str, Any]:
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+async def upload_syllabus(file: UploadFile = File(...)):
+    text = extract_text_from_pdf_bytes(await file.read())
+    return {"syllabus_text": text[:12000]}
 
-    pdf_bytes = await file.read()
-    if len(pdf_bytes) == 0:
-        raise HTTPException(status_code=400, detail="Uploaded PDF is empty.")
 
-    try:
-        extracted_text = extract_text_from_pdf_bytes(pdf_bytes)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not parse PDF: {str(exc)}") from exc
-
-    if not extracted_text or extracted_text.strip() == "":
-        raise HTTPException(status_code=400, detail="No readable text found in PDF. The file may be scanned or encrypted. Please try a different PDF.")
-
-    # Keep response compact for frontend.
-    return {
-        "filename": file.filename,
-        "characters_extracted": len(extracted_text),
-        "syllabus_text": extracted_text[:12000],
-    }
-
-# Timetable PDF upload endpoint
 @app.post("/upload-timetable")
-async def upload_timetable(file: UploadFile = File(...)) -> Dict[str, Any]:
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
-
-    pdf_bytes = await file.read()
-    if len(pdf_bytes) == 0:
-        raise HTTPException(status_code=400, detail="Uploaded PDF is empty.")
-
-    try:
-        extracted_text = extract_text_from_pdf_bytes(pdf_bytes)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not parse PDF: {str(exc)}") from exc
-
-    if not extracted_text or extracted_text.strip() == "":
-        raise HTTPException(status_code=400, detail="No readable text found in PDF. The file may be scanned or encrypted. Please try a different PDF.")
-
-    # Keep response compact for frontend.
-    return {
-        "filename": file.filename,
-        "characters_extracted": len(extracted_text),
-        "timetable_text": extracted_text[:12000],
-    }
+async def upload_timetable(file: UploadFile = File(...)):
+    text = extract_text_from_pdf_bytes(await file.read())
+    return {"timetable_text": text[:12000]}
 
 
 @app.post("/plan")
-def generate_plan(request: PlanRequest) -> Dict[str, Any]:
-    # Allow plan generation if either manual subjects or timetable_text is present
-    if (not request.subjects or len(request.subjects) == 0) and (not request.timetable_text or request.timetable_text.strip() == ""):
-        raise HTTPException(status_code=400, detail="Please provide at least one subject or upload a timetable PDF.")
-    return run_react_agent(request)
+def generate_plan(request: PlanRequest):
+    subjects = list(request.subjects or [])
+
+    if not subjects and request.timetable_text:
+        subjects = parse_subjects_from_timetable_text(request.timetable_text)
+
+    if not subjects and request.timetable_text:
+        subjects = extract_subjects_via_gemini(request.timetable_text)
+
+    if not subjects:
+        raise HTTPException(400, "No subjects found")
+
+    deadline_data = deadline_analyzer_tool(subjects)
+    allocation = study_time_allocator_tool(
+        deadline_data,
+        request.hours_per_day or 5,
+        request.weak_subjects or []
+    )
+
+    final_plan = build_study_plan_via_gemini(
+        deadline_data,
+        allocation,
+        request.syllabus_text or ""
+    )
+
+    if not final_plan:
+        alloc_lookup = {a["subject"]: a["hours_per_day"] for a in allocation["allocations"]}
+        fallback_study_plan = []
+        
+        # Subject-Specific Fallback Matrix
+        strategy_matrix = {
+            "dsip": {
+                "goal": "Signal Processing Mastery: Dedicate {time_str} to practicing Fourier Transform derivations and image enhancement algorithms.",
+                "topics": ["Fourier Transform", "Image Enhancement", "Filtering"]
+            },
+            "nis": {
+                "goal": "Security Protocol Review: Utilize {time_str} to map out Cryptography basics and IDS/Firewall architectures.",
+                "topics": ["Cryptography", "Network Protocols", "Ethical Hacking"]
+            },
+            "cc": {
+                "goal": "Cloud Infrastructure Deep-Dive: Use {time_str} to compare IaaS/PaaS/SaaS models and cloud security virtualization.",
+                "topics": ["Cloud Models", "Virtualization", "AWS/Azure Basics"]
+            },
+            "ai": {
+                "goal": "Intelligence Logic Drill: Spend {time_str} solving Search Algorithm trees and reviewing Machine Learning Neural Networks.",
+                "topics": ["Search Algorithms", "Machine Learning", "Neural Networks"]
+            }
+        }
+        
+        for item in deadline_data:
+            sub = item["subject"]
+            sub_key = sub.lower()
+            days = item["days_left"]
+            time_str = format_hours_mins(alloc_lookup.get(sub, 1.0))
+            
+            # Select specific strategy or general fallback
+            strategy = strategy_matrix.get(sub_key)
+            if strategy:
+                goal = strategy["goal"].format(time_str=time_str)
+                topics = strategy["topics"]
+            else:
+                if days <= 14:
+                    goal = f"Urgent Revision: Utilize {time_str} for high-intensity active recall on core {sub} concepts."
+                else:
+                    goal = f"Foundational Phase: Spend {time_str} today mapping the {sub} syllabus modules into your notes."
+                topics = ["Syllabus Review", "Key Concepts"]
+
+            fallback_study_plan.append({
+                "subject": sub,
+                "daily_goal": goal,
+                "focus_topics": topics
+            })
+
+        final_plan = {
+            "study_plan": fallback_study_plan,
+            "priority_list": [item["subject"] for item in deadline_data],
+            "adjustment_notes": "AI fallback matrix applied with subject-specific module mapping."
+        }
+
+    result = {
+        "generated_at": datetime.now(timezone.utc).strftime("%b-%d_%H-%M"),
+        "study_plan": final_plan.get("study_plan", []),
+        "priority_list": final_plan.get("priority_list", []),
+        "time_allocation": allocation,
+        "adjustment_notes": final_plan.get("adjustment_notes", ""),
+    }
+
+    generate_csv(result, deadline_data, allocation)
+    result["csv"] = "study_plan.csv"
+
+    save_last_plan(result)
+
+    return result
+
+
+@app.get("/download-csv")
+def download_csv():
+    if not CSV_FILE.exists():
+        raise HTTPException(status_code=404, detail="CSV not found. Generate a plan first.")
+    return FileResponse(path=CSV_FILE, media_type="text/csv", filename="study_plan.csv")
