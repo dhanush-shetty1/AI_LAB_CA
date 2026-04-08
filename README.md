@@ -26,7 +26,7 @@ An intelligent study scheduling application powered by AI that helps students cr
 
 ### Backend
 - **Framework**: FastAPI (Python)
-- **AI Integration**: Google Gemini 2.5 Flash
+- **AI Integration**: Google Gemini Pro
 - **PDF Processing**: PyPDF
 - **Data Validation**: Pydantic
 - **CORS**: Enabled for cross-origin requests
