@@ -305,37 +305,7 @@ npm run preview
 
 ---
 
-## 🔒 Security Considerations
 
-- CORS is currently set to allow all origins (`allow_origins=["*"]`). **For production deployment, restrict this to your domain.**
-- API key is loaded from environment variables and never exposed in code
-- PDF uploads are processed in-memory without persistent storage
-- Validate and sanitize all user inputs before processing
-
----
-
-## 🐛 Troubleshooting
-
-### Backend Issues
-
-**Missing GEMINI_API_KEY**
-```
-Error: Missing GEMINI_API_KEY environment variable
-```
-Solution: Add your API key to the `.env` file and restart the server.
-
-**CORS Errors**
-Solution: Ensure the frontend URL is allowed in the CORS middleware configuration.
-
-### Frontend Issues
-
-**Cannot connect to backend**
-```
-Error: Failed to fetch from http://localhost:8000
-```
-Solution: Ensure the backend server is running on port 8000.
-
----
 
 
 
